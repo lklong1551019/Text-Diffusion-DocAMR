@@ -8,6 +8,7 @@ __pycache__/
 
 # Our project exclusions
 checkpoints/
+generation/generated_output.txt
 
 
 # Distribution / packaging

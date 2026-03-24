@@ -79,8 +79,9 @@ class DocAMRDataset(Dataset):
                 graph_string = "\n".join(l for l in lines if not l.startswith('#'))
                 
                 try:
-                    graph = penman.decode(graph_string)
-                    print(f"check: graph_string: {graph_string}, penman graph: {graph}")
+                    # Look at explain_penman_graph.md for more detail of this graph
+                    graph = penman.decode(graph_string)                
+
                     documents.append({
                         "text": raw_text,
                         "graph": graph
