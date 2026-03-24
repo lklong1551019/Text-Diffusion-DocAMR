@@ -127,6 +127,7 @@ class DocAMRDataset(Dataset):
         """
         doc = self.documents[idx]
         # sample text: Hailey is going to London tomorrow . She is planning to go to Italy after London . She is going to see the Big Ben . Her friend Phil is meeting her in London .
+        # Graph: penman parsed graph, look at explain_penman_graph.md for more detail of this graph
         text = doc["text"]
         graph = doc["graph"]
 
@@ -138,10 +139,38 @@ class DocAMRDataset(Dataset):
             padding="max_length", 
             max_length=self.max_seq_len
         )
+        # {'input_ids': tensor([[    0, 24017,  9422,    16,   164,     7,   928,  3859,   479,  1437,
+        #    264,    16,  1884,     7,   213,     7,  2627,    71,   928,   479,
+        #   1437,   264,    16,   164,     7,   192,     5,  1776,  1664,   479,
+        #   1437,  1405,  1441,  4720,    16,   529,    69,    11,   928,   479,
+        #      2,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1,     1,     1,
+        #      1,     1,     1,     1,     1,     1,     1,     1]]), 'attention_mask': tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        #  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+        #  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        #  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        #  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        #  0, 0, 0, 0, 0, 0, 0, 0]])}
         
         with torch.no_grad():
             clean_embeds = self.text_encoder.embeddings.word_embeddings(inputs.input_ids).squeeze(0)
+        # tensor([[ 0.1476, -0.0365,  0.0753,  ..., -0.0023,  0.0172, -0.0016],
+        # [-0.0060, -0.1048, -0.1667,  ..., -0.1648, -0.0116,  0.2175],
+        # [ 0.0109,  0.2434, -0.0682,  ..., -0.2257, -0.0076, -0.0661],
+        # ...,
+        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156],
+        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156],
+        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156]])
+
+        
             
+
         # 2. Process Graph Nodes (AMR Concepts)
         node_ids = set()
         node_concepts = {}
@@ -191,6 +220,7 @@ class DocAMRDataset(Dataset):
             node_texts = ["empty"]
             node_id_to_idx = {"empty": 0}
             
+        # These concept labels are passed through the tokenizer
         node_inputs = self.tokenizer(
             node_texts, 
             return_tensors="pt", 
@@ -198,9 +228,11 @@ class DocAMRDataset(Dataset):
             truncation=True, 
             max_length=50 # Node values are just words, so lengths are tiny
         )
-        
+        # Then passed through text encoder to get node embeddings
         with torch.no_grad():
             node_embeds = self.text_encoder(**node_inputs).last_hidden_state[:, 0, :]
+
+
             
         # 3. Process Graph Edges (Relational Mapping)
         edge_sources = []
@@ -210,7 +242,11 @@ class DocAMRDataset(Dataset):
         for source, role, target in graph.edges():            
             # In AMR, "targets" can be string literals (e.g., "Hailey"). "Source" cannot be string literals
             # PyG edges strictly connect nodes to nodes. We skip literal edges for GNN connectivity mapping.
-            if source in node_id_to_idx and target in node_id_to_idx: 
+            if source in node_id_to_idx and target in node_id_to_idx:             
+                # source: s1.g, role: :ARG0, target: s1.p
+                # node_id_to_idx[source] = 15
+                # node_id_to_idx[target] = 23
+                # edge_type_to_id[role] = 1
                 edge_sources.append(node_id_to_idx[source])
                 edge_targets.append(node_id_to_idx[target])
                 edge_types.append(self.edge_type_to_id[role])            
@@ -222,6 +258,15 @@ class DocAMRDataset(Dataset):
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_type = torch.empty((0,), dtype=torch.long)
+        # Edge_index: tensor([[21, 15, 23, 15,  3, 15, 21,  0,  0,  5,  5, 11,  5, 19, 12, 12, 21, 16,
+        #  24, 16, 22, 21, 25,  2, 13, 13, 10, 13, 25, 25,  1,  1],
+        # [15, 23,  4,  3, 14,  9,  0, 26,  5, 26, 11, 17, 19, 12, 18,  3, 16, 24,
+        #  26, 22,  7, 25,  2,  8,  2, 10, 26,  6, 10,  1, 20,  3]])
+
+        # Edge_type: tensor([ 0,  1,  2,  3,  2,  4,  5,  1,  6,  1,  3,  2,  4,  7,  2,  8,  9,  1,
+        #  8,  6,  2, 10,  1,  2,  1,  6,  8, 11,  6, 12,  2,  8])
+
+
             
         # Create standard standalone PyG Data object
         data = Data(
@@ -254,13 +299,18 @@ def docamr_collate_fn(data_list):
     Returns:
         dict: A dictionary containing "clean_embeds" (dense batch) and "graph_batch" (PyG batch).
     """
+
+    # torch.Size([128, 768])
     clean_embeds_list = [data.clean_embeds for data in data_list]
-    clean_embeds_batch = torch.stack(clean_embeds_list, dim=0)
+    # torch.Size([1, 128, 768])
+    clean_embeds_batch = torch.stack(clean_embeds_list, dim=0)    
     
     # Remove it from PyG objects to prevent PyG from blindly concatenating the sequence dimensions
     for data in data_list:
+        # Data(x=[27, 768], edge_index=[2, 32], edge_type=[32], clean_embeds=[128, 768])
         del data.clean_embeds
         
+    # DataBatch(x=[27, 768], edge_index=[2, 32], edge_type=[32], batch=[27], ptr=[2])
     graph_batch = Batch.from_data_list(data_list)
     
     return {
