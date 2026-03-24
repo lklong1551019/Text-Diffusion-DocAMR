@@ -158,18 +158,9 @@ class DocAMRDataset(Dataset):
         #  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         #  0, 0, 0, 0, 0, 0, 0, 0]])}
         
-        with torch.no_grad():
-            clean_embeds = self.text_encoder.embeddings.word_embeddings(inputs.input_ids).squeeze(0)
-        # tensor([[ 0.1476, -0.0365,  0.0753,  ..., -0.0023,  0.0172, -0.0016],
-        # [-0.0060, -0.1048, -0.1667,  ..., -0.1648, -0.0116,  0.2175],
-        # [ 0.0109,  0.2434, -0.0682,  ..., -0.2257, -0.0076, -0.0661],
-        # ...,
-        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156],
-        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156],
-        # [ 0.0156,  0.0076, -0.0118,  ..., -0.0022,  0.0081, -0.0156]])
-
-        
-            
+        # For discrete masked diffusion, we extract raw token ids
+        target_ids = inputs.input_ids.squeeze(0)
+        target_mask = inputs.attention_mask.squeeze(0)
 
         # 2. Process Graph Nodes (AMR Concepts)
         node_ids = set()
@@ -273,47 +264,52 @@ class DocAMRDataset(Dataset):
             x=node_embeds,          
             edge_index=edge_index,  
             edge_type=edge_type,    
-            clean_embeds=clean_embeds 
+            target_ids=target_ids,
+            target_mask=target_mask
         )
         return data
 
 def docamr_collate_fn(data_list):
     """
-    Custom collate function for batching DocAMR PyG Data objects.
+    Custom collate function for batching DocAMR PyG Data objects for Discrete Text Diffusion.
     
     Why this is needed:
-    - Standard text embeddings (`clean_embeds`) require standard dense batching 
-      giving a final shape of [batch_size, seq_len, hidden_dim].
-    - Graph data (nodes and edges) require PyTorch Geometric's Block Diagonal Batching 
-      which merges separate graphs into a single giant disconnected graph.
+    - Discrete sequence tokens (`target_ids`, `target_mask`) require standard padding and dense batching
+      giving a final shape of [batch_size, seq_len].
+    - AMR Graph data (nodes and edges) require PyTorch Geometric's Block Diagonal Batching 
+      which merges separate graph samples into a single massive disconnected graph batch.
     
     Step-by-step batching process:
-    1. Extracts `clean_embeds` from every data object in the batch and stacks them densely.
-    2. Deletes `clean_embeds` from the PyG data objects to prevent PyG from incorrectly 
-       batching the sequence dimensions.
-    3. Calls PyG's `Batch.from_data_list()` to properly block-diagonalize the nodes and edges.
+    1. Extracts discrete `target_ids` and `target_mask` from every data object and stacks them compactly.
+    2. Deletes these sequential arrays from the PyG data objects to prevent PyG's internal systems 
+       from misinterpreting and flattening the text sequences along the node dimension.
+    3. Calls PyG's `Batch.from_data_list()` to properly block-diagonalize the individual node graphs.
     
     Args:
         data_list (list[Data]): A list of PyG Data objects from `__getitem__`.
         
     Returns:
-        dict: A dictionary containing "clean_embeds" (dense batch) and "graph_batch" (PyG batch).
+        dict: A dictionary containing standard 2D discrete text matrices ("target_ids", "target_mask") 
+              and the block diagonal PyG batch ("graph_batch").
     """
 
-    # torch.Size([128, 768])
-    clean_embeds_list = [data.clean_embeds for data in data_list]
-    # torch.Size([1, 128, 768])
-    clean_embeds_batch = torch.stack(clean_embeds_list, dim=0)    
+    target_ids_list = [data.target_ids for data in data_list]
+    target_mask_list = [data.target_mask for data in data_list]
     
-    # Remove it from PyG objects to prevent PyG from blindly concatenating the sequence dimensions
+    target_ids_batch = torch.stack(target_ids_list, dim=0)    
+    target_mask_batch = torch.stack(target_mask_list, dim=0)
+    
+    # Remove them from PyG objects to prevent PyG from blindly concatenating the sequence dimensions
     for data in data_list:
-        # Data(x=[27, 768], edge_index=[2, 32], edge_type=[32], clean_embeds=[128, 768])
-        del data.clean_embeds
+        del data.target_ids
+        del data.target_mask
+        if hasattr(data, 'clean_embeds'):
+            del data.clean_embeds
         
-    # DataBatch(x=[27, 768], edge_index=[2, 32], edge_type=[32], batch=[27], ptr=[2])
     graph_batch = Batch.from_data_list(data_list)
     
     return {
-        "clean_embeds": clean_embeds_batch,
+        "target_ids": target_ids_batch,
+        "target_mask": target_mask_batch,
         "graph_batch": graph_batch
     }

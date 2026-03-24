@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig, PreTrainedModel, get_scheduler, AutoTokenizer
+from transformers import AutoModel, AutoModelForMaskedLM, AutoConfig, PreTrainedModel, get_scheduler, AutoTokenizer
 from torch.optim import AdamW
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -53,52 +53,39 @@ class DiffusionDenoisingModel(nn.Module):
         # The new Graph Encoder
         self.amr_encoder = GraphAMREncoder(node_dim, hidden_dim, num_relations=num_relations)
         
-        # The Hugging Face Transformer Backbone
-        self.transformer = AutoModel.from_config(denoiser_config)
+        # The Hugging Face Transformer Backbone for Masked Language Modeling
+        self.transformer = AutoModelForMaskedLM.from_config(denoiser_config)
         self.time_embed = nn.Embedding(timesteps, hidden_dim)
 
     def forward(self, x_t, t, amr_x, amr_edge_index, amr_edge_type, amr_batch_index):
         """
-        x_t: Noisy text embeddings [batch_size, seq_len, hidden_dim]
+        x_t: Discrete token ids (some masked) [batch_size, seq_len]
         t: Timestep [batch_size]
         """
         # 1. Encode the Structural Graph
-        # amr_context is now dynamically shaped based on the largest graph in the batch
         amr_context, amr_mask = self.amr_encoder(amr_x, amr_edge_index, amr_edge_type, amr_batch_index)
         
-        # 2. Inject Timestep into noisy text
+        # 2. Get embeddings and inject Timestep
+        inputs_embeds = self.transformer.get_input_embeddings()(x_t)
         t_emb = self.time_embed(t).unsqueeze(1)
-        x_t = x_t + t_emb
+        inputs_embeds = inputs_embeds + t_emb
         
         # 3. Cross-Attention Denoising
-        # The Transformer looks at the text (x_t) and attends to the Graph (amr_context)
-        # We pass the amr_mask so it doesn't attend to empty padded nodes!
+        # The model predicts the vocabulary logits for every token position
         outputs = self.transformer(
-            inputs_embeds=x_t,
+            inputs_embeds=inputs_embeds,
             encoder_hidden_states=amr_context, 
-            encoder_attention_mask=amr_mask, # CRITICAL: Ignore padded graph nodes
+            encoder_attention_mask=amr_mask,
             return_dict=True
         )
         
-        return outputs.last_hidden_state
+        return outputs.logits
 
-
-def get_ddpm_schedule(timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cuda"):
-    betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    
-    return {
-        "betas": betas,
-        "alphas": alphas,
-        "alphas_cumprod": alphas_cumprod,
-        "sqrt_alphas_cumprod": torch.sqrt(alphas_cumprod),
-        "sqrt_one_minus_alphas_cumprod": torch.sqrt(1.0 - alphas_cumprod)
-    }
 
 def train_diffusion_model(
     model, 
     dataloader, 
+    tokenizer,
     epochs=10, 
     lr=1e-4, 
     device="cuda",
@@ -112,27 +99,21 @@ def train_diffusion_model(
 
     model.to(device)
 
-    # 0. Setup DDPM Noise Schedule
-    schedule = get_ddpm_schedule(timesteps, device=device)
-    sqrt_alphas_cumprod = schedule["sqrt_alphas_cumprod"]
-    sqrt_one_minus_alphas_cumprod = schedule["sqrt_one_minus_alphas_cumprod"]
-
     # 1. Setup Optimizer and Scheduler
-    # AdamW is standard for Transformers. We apply weight decay to prevent overfitting.
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     
-    # A linear warmup scheduler helps stabilize early Transformer training
     num_training_steps = epochs * len(dataloader)
     lr_scheduler = get_scheduler(
         name="linear",
         optimizer=optimizer,
-        num_warmup_steps=int(0.1 * num_training_steps), # 10% warmup
+        num_warmup_steps=int(0.1 * num_training_steps),
         num_training_steps=num_training_steps
     )
 
-    # 2. Setup Loss Function and Mixed Precision Scaler
-    criterion = nn.MSELoss()
-    scaler = GradScaler() # Helps prevent underflow/overflow in fp16 training
+    # 2. Setup Loss Function for Discrete Tokens
+    # We ignore -100 which is the standard PyTorch ignore index for unmasked tokens
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    scaler = GradScaler() 
 
     start_epoch = 0
     best_loss = float('inf')
@@ -160,8 +141,8 @@ def train_diffusion_model(
             optimizer.zero_grad()
 
             # --- A. Extract Tensors and Move to Device ---
-            # Text embeddings (Clean data, x_0)
-            clean_text_embeds = batch['clean_embeds'].to(device) # Shape: [batch, seq_len, dim]
+            # Discrete token ids (Clean data, x_0)
+            clean_text_ids = batch['target_ids'].to(device) # Shape: [batch, seq_len]
             
             # PyTorch Geometric Graph Data
             graph_batch = batch['graph_batch'].to(device)
@@ -170,47 +151,44 @@ def train_diffusion_model(
             amr_edge_type = graph_batch.edge_type   # Shape: [total_edges]
             amr_batch_index = graph_batch.batch     # Shape: [total_nodes]
 
-            batch_size = clean_text_embeds.shape[0]
+            batch_size = clean_text_ids.shape[0]
+            seq_len = clean_text_ids.shape[1]
 
-
-
-
-            # --- B. Forward Diffusion Process
+            # --- B. Forward Diffusion Process (Discrete Masking)
             # Sample a random timestep t for each item in the batch
             t = torch.randint(0, timesteps, (batch_size,), device=device).long()
             
-            # Sample random Gaussian noise
-            noise = torch.randn_like(clean_text_embeds)
+            # Masking ratio r(t) = t / timesteps (0.0 to 1.0)
+            ratios = (t.float() / timesteps).unsqueeze(1) # [batch_size, 1]
             
-            # Extract the DDPM schedule values for the sampled timesteps
-            # .view(-1, 1, 1) reshapes to [batch_size, 1, 1] for broadcasting over [batch, seq_len, dim]
-            sqrt_alpha_t = sqrt_alphas_cumprod[t].view(-1, 1, 1)
-            sqrt_one_minus_alpha_t = sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+            rand = torch.rand((batch_size, seq_len), device=device)
+            pad_token_id = tokenizer.pad_token_id
+            mask_token_id = tokenizer.mask_token_id
             
-            # Create noisy text x_t using the accurate mathematical DDPM formulation
-            # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-            x_t = sqrt_alpha_t * clean_text_embeds + sqrt_one_minus_alpha_t * noise 
-
-
-
+            # Mask tokens if random value < ratio (we allow masking pad tokens so it learns variable sequence lengths!)
+            mask_condition = (rand < ratios)
+            
+            x_t = clean_text_ids.clone()
+            x_t[mask_condition] = mask_token_id
 
             # --- C. Prediction and Loss
-            # Passes the noisy text, timestep, and AMR structural graphs to the model to predict the original noise, 
-            #   using a simple Mean Squared Error
             with autocast():
-                # The model tries to predict the NOISE that was added, 
-                # using the Structural Graph as guidance.
-                predicted_noise = model(
+                # The model predicts the vocabulary logits for ALL tokens
+                logits = model(
                     x_t=x_t, 
                     t=t, 
                     amr_x=amr_x, 
                     amr_edge_index=amr_edge_index, 
                     amr_edge_type=amr_edge_type,
                     amr_batch_index=amr_batch_index
-                )
+                ) # [batch_size, seq_len, vocab_size]
                 
-                # Calculate Mean Squared Error
-                loss = criterion(predicted_noise, noise)
+                # We only calculate loss on the tokens we explicitly MASKED
+                labels = clean_text_ids.clone()
+                labels[~mask_condition] = -100 # Ignore unmasked tokens
+                
+                # CrossEntropy expects [N, C] and [N]
+                loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
 
 
 
@@ -276,7 +254,7 @@ def train_diffusion_model(
             print(f"--> Saved new Best Model to {best_model_path} (Loss: {best_loss:.4f})")
 
 
-@torch.no_grad() # Crucial: We do not track gradients during generation
+@torch.no_grad()
 def generate_text_from_amr(
     model, 
     base_model_name, 
@@ -288,14 +266,10 @@ def generate_text_from_amr(
     model.eval()
     model.to(device)
     
-    # 1. Load Tokenizer and Word Embeddings for final decoding
-    # Since the diffusion model operates completely in the continuous latent space (embeddings), 
-    #   we need the base transformer's tokenizer and underlying word_embeddings matrix to map the final continuous 
-    #   tensors back into discrete vocabulary IDs (actual words). 
-    # It then extracts the AMR structure (Nodes, Edges, and Batch connectivity) exactly like the training loop.
+    # 1. Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    word_embeddings = model.transformer.embeddings.word_embeddings.weight 
-
+    mask_token_id = tokenizer.mask_token_id
+    
     # Extract the graph data
     graph_batch = amr_batch['graph_batch'].to(device)
     amr_x = graph_batch.x
@@ -304,32 +278,19 @@ def generate_text_from_amr(
     amr_batch_index = graph_batch.batch
     
     batch_size = amr_batch_index.max().item() + 1
-    hidden_dim = model.amr_encoder.layer_norm.normalized_shape[0]
 
+    # 2. Start with 100% Masked Sequence (The "Blank Canvas")
+    x_t = torch.full((batch_size, seq_length), mask_token_id, device=device, dtype=torch.long)
 
+    print("Starting discrete reverse diffusion (Confidence-based Decoding)...")
 
-
-    # 2. Start with Pure Gaussian Noise (The "Blank Canvas")
-    # Shape: [batch_size, seq_length, hidden_dim]
-    x_t = torch.randn((batch_size, seq_length, hidden_dim), device=device)
-
-    # Get the proper DDPM schedule
-    schedule = get_ddpm_schedule(num_timesteps, device=device)
-    beta = schedule["betas"]
-    alpha = schedule["alphas"]
-    alpha_bar = schedule["alphas_cumprod"]
-
-    print("Starting reverse diffusion...")
-
-   
-    
-    # 3. The Reverse Loop (from T down to 0)
-    for t_step in reversed(range(num_timesteps)):
-        # Create a tensor of the current timestep for the batch
+    # 3. The Reverse Loop (from T-1 down to 0)
+    # At each step, we progressively unmask tokens based on model confidence.
+    for t_step in reversed(range(0, num_timesteps)):
         t_tensor = torch.full((batch_size,), t_step, device=device, dtype=torch.long)
         
-        # A. Predict the noise present in the current x_t
-        predicted_noise = model(
+        # A. Predict the logits for all tokens
+        logits = model(
             x_t=x_t, 
             t=t_tensor, 
             amr_x=amr_x, 
@@ -338,43 +299,43 @@ def generate_text_from_amr(
             amr_batch_index=amr_batch_index
         )
         
-        # B. The DDPM Reverse Step Math
-        # We subtract a scaled version of the predicted noise to get a slightly cleaner x
-        # Formula: x_{t-1} = (1 / sqrt(alpha_t)) * (x_t - (1 - alpha_t) / sqrt(1 - alpha_bar_t) * pred_noise)
-        a_t = alpha[t_step]
-        a_bar_t = alpha_bar[t_step]
+        # B. Get probabilities and most likely tokens
+        probs = torch.softmax(logits, dim=-1)
+        max_probs, predicted_ids = torch.max(probs, dim=-1)
         
-        # Calculate the mean of the previous step
-        mean = (1.0 / torch.sqrt(a_t)) * (x_t - ((1.0 - a_t) / torch.sqrt(1.0 - a_bar_t)) * predicted_noise)
+        # We only evaluate tokens that are CURRENTLY masked
+        is_masked = (x_t == mask_token_id)
         
-        # Add a tiny bit of random variance back in (Langevin dynamics), unless it's the final step
-        if t_step > 0:
-            z = torch.randn_like(x_t)
-            variance = torch.sqrt(beta[t_step]) * z
-        else:
-            variance = 0.0
+        if not is_masked.any():
+            break
             
-        x_t = mean + variance
+        # C. Partially Unmask
+        for i in range(batch_size):
+            masked_indices = is_masked[i].nonzero(as_tuple=True)[0]
+            num_masked = len(masked_indices)
+            
+            if num_masked == 0:
+                continue
+                
+            # Unmask a fraction of the remaining tokens. 
+            # If t_step=0 (last step), unmask everything remaining.
+            steps_remaining = t_step + 1
+            num_to_unmask = max(1, int(num_masked / steps_remaining))
+            if t_step == 0:
+                num_to_unmask = num_masked
+                
+            # Find the most confident predictions among the masked tokens
+            masked_probs = max_probs[i, masked_indices]
+            _, topk_relative_indices = torch.topk(masked_probs, k=num_to_unmask)
+            topk_absolute_indices = masked_indices[topk_relative_indices]
+            
+            # Permanently unmask these tokens by replacing [MASK] with the predicted ID
+            x_t[i, topk_absolute_indices] = predicted_ids[i, topk_absolute_indices]
 
-
-
-    # 4. Latent to Discrete Decoding (The "Rounding" Step)
-    # x_t is now x_0 (our clean, continuous embeddings). 
-    # We calculate the cosine similarity (or dot product) between our generated embeddings 
-    # and every word in the BERT vocabulary to find the closest match.
-    
-    # x_t shape: [batch, seq_length, hidden_dim]
-    # word_embeddings shape: [vocab_size, hidden_dim]
-    # logits shape: [batch, seq_length, vocab_size]
-    logits = torch.matmul(x_t, word_embeddings.T) 
-    
-    # Get the token ID with the highest score for each position
-    predicted_token_ids = torch.argmax(logits, dim=-1)
-    
-    # 5. Convert IDs back to human-readable strings
+    # 4. Convert IDs back to human-readable strings
     generated_texts = []
     for i in range(batch_size):
-        tokens = predicted_token_ids[i].tolist()
+        tokens = x_t[i].tolist()
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         generated_texts.append(text)
         
@@ -410,5 +371,7 @@ if __name__ == "__main__":
         num_relations=dataset.num_relations
     )
 
-    # 4. Train!
-    train_diffusion_model(model, dataloader, epochs=3)
+    # 4. Load Tokenizer & Train!
+    tokenizer = AutoTokenizer.from_pretrained("roberta-base")
+    # Hint: Diffusion models require LOTS of epochs to learn. 3 epochs is not enough. Try 200+
+    train_diffusion_model(model, dataloader, tokenizer, epochs=300)
